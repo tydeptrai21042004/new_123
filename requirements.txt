@@ -1,0 +1,9 @@
+numpy
+h5py
+matplotlib
+scipy
+PyWavelets
+scikit-image
+ismrmrd
+pandas
+tabulate
