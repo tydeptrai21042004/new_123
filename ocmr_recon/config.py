@@ -109,10 +109,7 @@ class ExperimentConfig:
     reference_mode: str = "sense"
 
     methods_to_run: Tuple[str, ...] = (
-        "cg_sense_tikh",
-        "fista_sense_wavelet",
-        "fista_sense_tfft",
-        "pgd_sense_lowrank",
+
         "prop2_sense_pgd_v2",
     )
 
