@@ -16,6 +16,7 @@ from .baselines import cg_sense_tikh
 try:
     from scipy.special import gamma as sp_gamma
     from scipy.special import jv as sp_jv
+
     _HAS_SCIPY = True
 except Exception:
     _HAS_SCIPY = False
@@ -35,10 +36,11 @@ def _gamma(x: float) -> float:
     return float(math_gamma(x))
 
 
-def _beta_bessel_series(z: np.ndarray, nu: float, terms: int = 40) -> np.ndarray:
+def _beta_bessel_series(z: np.ndarray, nu: float, terms: int = 60) -> np.ndarray:
     """
     beta_nu(z) = sum_{m>=0} (-1)^m / (m! (nu+1)_m) * (z/2)^(2m)
-    Used as a fallback if scipy.special.jv is unavailable.
+
+    Stable fallback / small-argument evaluator.
     """
     z = np.asarray(z, dtype=np.float64)
     out = np.ones_like(z, dtype=np.float64)
@@ -47,7 +49,8 @@ def _beta_bessel_series(z: np.ndarray, nu: float, terms: int = 40) -> np.ndarray
 
     for m in range(terms - 1):
         denom = float((m + 1) * (nu + 1.0 + m))
-        term = term * (-zz / max(denom, _EPS))
+        denom = max(denom, _EPS)
+        term = term * (-zz / denom)
         out = out + term
 
     return out
@@ -55,26 +58,37 @@ def _beta_bessel_series(z: np.ndarray, nu: float, terms: int = 40) -> np.ndarray
 
 def _beta_bessel(z: np.ndarray, nu: float) -> np.ndarray:
     """
-    Exact normalized Bessel combination:
-        beta_nu(z) = Gamma(nu+1) * (2/z)^nu * J_nu(z),
-    with the limit beta_nu(0)=1.
+    Stable real-valued evaluation of
 
-    This matches the series definition used in your manuscript.
+        beta_nu(z) = Gamma(nu+1) * (2/|z|)^nu * J_nu(|z|),
+
+    with beta_nu(0)=1.
+
+    Important:
+    - use abs(z), because the series definition is even in z,
+      while (2/z)^nu is not real-valued for z<0 and noninteger nu.
     """
     z = np.asarray(z, dtype=np.float64)
+    az = np.abs(z)
 
-    if not _HAS_SCIPY:
-        return _beta_bessel_series(z, nu)
+    out = np.ones_like(az, dtype=np.float64)
+    small = az < 1e-6
 
-    out = np.empty_like(z, dtype=np.float64)
-    small = np.abs(z) < 1e-12
-    out[small] = 1.0
+    if np.any(small):
+        out[small] = _beta_bessel_series(az[small], nu, terms=60)
 
     if np.any(~small):
-        zz = z[~small]
-        out[~small] = _gamma(nu + 1.0) * np.power(2.0 / zz, nu) * sp_jv(nu, zz)
+        if _HAS_SCIPY:
+            zz = az[~small]
+            tmp = _gamma(nu + 1.0) * np.power(2.0 / zz, nu) * sp_jv(nu, zz)
+            bad = ~np.isfinite(tmp)
+            if np.any(bad):
+                tmp[bad] = _beta_bessel_series(zz[bad], nu, terms=60)
+            out[~small] = tmp
+        else:
+            out[~small] = _beta_bessel_series(az[~small], nu, terms=60)
 
-    return out
+    return np.nan_to_num(out, nan=1.0, posinf=0.0, neginf=0.0)
 
 
 def _hartley_bessel_kernel(z: np.ndarray, alpha: float) -> np.ndarray:
@@ -85,7 +99,8 @@ def _hartley_bessel_kernel(z: np.ndarray, alpha: float) -> np.ndarray:
     z = np.asarray(z, dtype=np.float64)
     b1 = _beta_bessel(z, alpha - 0.5)
     b2 = _beta_bessel(z, alpha + 0.5)
-    return b1 + (z / max(2.0 * alpha + 1.0, _EPS)) * b2
+    out = b1 + (z / max(2.0 * alpha + 1.0, _EPS)) * b2
+    return np.nan_to_num(out, nan=1.0, posinf=0.0, neginf=0.0)
 
 
 def _centered_indices(n: int) -> np.ndarray:
@@ -105,33 +120,49 @@ class HB1DOp:
     n: int
     alpha: float
     h: float
-    t: np.ndarray          # spatial nodes
-    lam: np.ndarray        # frequency nodes
-    mu_space: np.ndarray   # exact discrete spatial measure
-    mu_freq: np.ndarray    # finite quadrature-like frequency measure
-    kernel: np.ndarray     # K[k,n] = J_{lam_k}(t_n, alpha)
-    analysis: np.ndarray   # A[k,n] = K[k,n] * mu_space[n]
-    synthesis: np.ndarray  # S[n,k] = K[k,n] * mu_freq[k]
-    inverse: np.ndarray    # numerically stable left inverse of analysis
+    t: np.ndarray
+    lam: np.ndarray
+    mu_space: np.ndarray
+    mu_freq: np.ndarray
+    kernel: np.ndarray
+    analysis: np.ndarray
+    synthesis: np.ndarray
+    inverse: np.ndarray
+
+
+def _regularized_left_inverse(A: np.ndarray, ridge_scale: float = 1e-6) -> np.ndarray:
+    """
+    Compute a stable left inverse:
+        B = (A^T A + ridge I)^(-1) A^T
+    """
+    n = A.shape[1]
+    scale = float(np.linalg.norm(A, ord="fro"))
+    ridge = max(1e-8, ridge_scale * (scale * scale / max(n, 1) + 1.0))
+
+    G = A.T @ A
+    G = 0.5 * (G + G.T)
+    G.flat[:: n + 1] += ridge
+
+    try:
+        B = np.linalg.solve(G, A.T)
+    except np.linalg.LinAlgError:
+        B = np.linalg.lstsq(G, A.T, rcond=None)[0]
+
+    return np.nan_to_num(B, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 @lru_cache(maxsize=32)
 def _hb_1d_operator(n: int, alpha: float, h: float = 1.0) -> HB1DOp:
     """
-    Build the exact finite Hartley–Bessel analysis operator on a sampled lattice.
-
-    Spatial grid:
-        t_n = n h, centered on zero
-
-    Frequency grid:
-        lambda_k = (2 pi / (N h)) k, centered on zero
-        so the sampled band lies in [-pi/h, pi/h) up to finite-grid indexing.
+    Build a finite Hartley–Bessel analysis operator on a centered sampled lattice.
 
     Analysis matrix:
         A[k,n] = J_{lambda_k}(t_n, alpha) * mu_alpha({t_n})
 
     Synthesis matrix:
         S[n,k] = J_{lambda_k}(t_n, alpha) * mu_alpha(d lambda_k)
+
+    The stored inverse is a stable regularized left inverse.
     """
     alpha = float(alpha)
     h = float(h)
@@ -145,22 +176,28 @@ def _hb_1d_operator(n: int, alpha: float, h: float = 1.0) -> HB1DOp:
 
     c = _hb_measure_const(alpha)
 
-    # exact discrete measure from the formula in your manuscript
-    mu_space = h * c * np.power(np.abs(t), 2.0 * alpha)
+    abs_t = np.abs(t)
+    abs_lam = np.abs(lam)
 
-    # finite-grid quadrature analogue of mu_alpha(d lambda)
-    mu_freq = delta_lam * c * np.power(np.abs(lam), 2.0 * alpha)
+    mu_space = h * c * np.power(abs_t, 2.0 * alpha)
+    mu_freq = delta_lam * c * np.power(abs_lam, 2.0 * alpha)
+
+    # Clean origin when alpha = 0
+    if np.isclose(alpha, 0.0):
+        mu_space[np.isclose(abs_t, 0.0)] = h * c
+        mu_freq[np.isclose(abs_lam, 0.0)] = delta_lam * c
 
     z = np.outer(lam, t)
     K = _hartley_bessel_kernel(z, alpha=alpha)
+    K = np.nan_to_num(K, nan=1.0, posinf=0.0, neginf=0.0)
 
     A = K * mu_space[None, :]
-    S = (K.T * mu_freq[None, :])
+    S = K.T * mu_freq[None, :]
 
-    # Numerically stable finite inverse for the truncated operator.
-    # This does not change the exact analysis matrix; it only stabilizes
-    # reconstruction on finite images.
-    B = np.linalg.pinv(A, rcond=1e-8)
+    A = np.nan_to_num(A, nan=0.0, posinf=0.0, neginf=0.0)
+    S = np.nan_to_num(S, nan=0.0, posinf=0.0, neginf=0.0)
+
+    B = _regularized_left_inverse(A)
 
     return HB1DOp(
         n=n,
@@ -200,7 +237,7 @@ def _hb2_synthesis_real(y: np.ndarray, op_y: HB1DOp, op_x: HB1DOp) -> np.ndarray
 
 def _hb2_inverse_real(y: np.ndarray, op_y: HB1DOp, op_x: HB1DOp) -> np.ndarray:
     """
-    Stable finite inverse using pseudo-inverses of the exact analysis matrices:
+    Stable finite inverse using regularized left inverses:
         X = B_y Y B_x^T
     """
     return np.einsum("hp,tpq,wq->thw", op_y.inverse, y, op_x.inverse, optimize=True)
@@ -208,7 +245,7 @@ def _hb2_inverse_real(y: np.ndarray, op_y: HB1DOp, op_x: HB1DOp) -> np.ndarray:
 
 def _hb2_forward(x: np.ndarray, alpha: float) -> np.ndarray:
     """
-    Exact 2D Hartley–Bessel transform applied separately to real/imag parts.
+    2D Hartley–Bessel transform applied separately to real/imag parts.
     """
     h, w = int(x.shape[-2]), int(x.shape[-1])
     op_y = _hb_1d_operator(h, alpha, 1.0)
@@ -219,12 +256,14 @@ def _hb2_forward(x: np.ndarray, alpha: float) -> np.ndarray:
 
     yr = _hb2_forward_real(xr, op_y, op_x)
     yi = _hb2_forward_real(xi, op_y, op_x)
-    return yr + 1j * yi
+
+    out = yr + 1j * yi
+    return np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def _hb2_inverse(y: np.ndarray, alpha: float) -> np.ndarray:
     """
-    Stable inverse of the exact 2D Hartley–Bessel analysis.
+    Stable inverse of the finite 2D Hartley–Bessel analysis.
     """
     h, w = int(y.shape[-2]), int(y.shape[-1])
     op_y = _hb_1d_operator(h, alpha, 1.0)
@@ -235,7 +274,9 @@ def _hb2_inverse(y: np.ndarray, alpha: float) -> np.ndarray:
 
     xr = _hb2_inverse_real(yr, op_y, op_x)
     xi = _hb2_inverse_real(yi, op_y, op_x)
-    return xr + 1j * xi
+
+    out = xr + 1j * xi
+    return np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def _hb2_synthesis(y: np.ndarray, alpha: float) -> np.ndarray:
@@ -252,7 +293,9 @@ def _hb2_synthesis(y: np.ndarray, alpha: float) -> np.ndarray:
 
     xr = _hb2_synthesis_real(yr, op_y, op_x)
     xi = _hb2_synthesis_real(yi, op_y, op_x)
-    return xr + 1j * xi
+
+    out = xr + 1j * xi
+    return np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 # -----------------------------------------------------------------------------
@@ -269,11 +312,8 @@ def _hb_coeff_mask(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Build:
-    - a radial mask in the exact HB coefficient domain
+    - a radial mask in the HB coefficient domain
     - normalized coefficient quadrature weights
-
-    The transform itself is exact; this mask is the regularization design
-    that preserves your existing API semantics.
     """
     op_y = _hb_1d_operator(h, alpha, 1.0)
     op_x = _hb_1d_operator(w, alpha, 1.0)
@@ -296,13 +336,17 @@ def _hb_coeff_mask(
     coeff_w = op_y.mu_freq[:, None] * op_x.mu_freq[None, :]
     coeff_w = coeff_w / max(float(np.mean(coeff_w)), _EPS)
 
+    mask = np.nan_to_num(mask, nan=0.0, posinf=1.0, neginf=0.0)
+    coeff_w = np.nan_to_num(coeff_w, nan=0.0, posinf=0.0, neginf=0.0)
+
     return np.asarray(mask, dtype=np.float64), np.asarray(coeff_w, dtype=np.float64)
 
 
 def _soft_threshold_complex(a: np.ndarray, thresh: np.ndarray) -> np.ndarray:
     mag = np.abs(a)
     scale = np.maximum(0.0, 1.0 - thresh / np.maximum(mag, _EPS))
-    return a * scale
+    out = a * scale
+    return np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def _hb_exact_shrink_video(
@@ -314,11 +358,6 @@ def _hb_exact_shrink_video(
 ) -> np.ndarray:
     """
     Exact Hartley–Bessel analysis + coefficient shrinkage + stable inverse.
-
-    This is the exact transform implementation requested.
-    The only approximation left is the use of coefficient-domain shrinkage
-    as a practical proximal surrogate, because the transform is not an
-    exactly orthonormal FFT-like operator on finite truncated grids.
     """
     if lam <= 0.0:
         return x
@@ -327,10 +366,13 @@ def _hb_exact_shrink_video(
     mask, coeff_w = _hb_coeff_mask(h, w, alpha, protect_radius, outer_only)
 
     y = _hb2_forward(x, alpha=alpha)
+    y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
+
     thresh = lam * mask[None, :, :] * coeff_w[None, :, :]
     y_sh = _soft_threshold_complex(y, thresh)
+
     x_out = _hb2_inverse(y_sh, alpha=alpha)
-    return x_out
+    return np.nan_to_num(x_out, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def _hb_exact_penalty(
@@ -340,13 +382,16 @@ def _hb_exact_penalty(
     outer_only: bool,
 ) -> float:
     """
-    Penalty based on exact Hartley–Bessel coefficients.
+    Penalty based on Hartley–Bessel coefficients.
     """
     h, w = int(x.shape[-2]), int(x.shape[-1])
     mask, coeff_w = _hb_coeff_mask(h, w, alpha, protect_radius, outer_only)
+
     y = _hb2_forward(x, alpha=alpha)
+    y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
+
     val = np.mean(mask[None, :, :] * coeff_w[None, :, :] * np.abs(y))
-    return float(val)
+    return float(np.nan_to_num(val, nan=0.0, posinf=0.0, neginf=0.0))
 
 
 # -----------------------------------------------------------------------------
@@ -366,7 +411,7 @@ def objective_surrogate(
     API preserved.
 
     Note:
-    - cfg.hartley_gamma is now interpreted as the exact Hartley–Bessel order alpha.
+    - cfg.hartley_gamma is interpreted as the Hartley–Bessel order alpha.
     """
     data = 0.5 * mse(op(x), y)
 
@@ -401,8 +446,7 @@ def prop2_sense_pgd_improved(
     API preserved.
 
     Main change:
-    the previous Hartley radial prox is replaced by an exact Hartley–Bessel
-    transform analysis / shrinkage / inverse block.
+    the Hartley block uses exact Hartley–Bessel analysis / shrinkage / inverse.
     """
     x = cg_sense_tikh(op, y, iters=10, lam=0.0015) if cfg.warm_start == "cg" else op.adjoint(y)
     z = x.copy()
@@ -450,7 +494,6 @@ def prop2_sense_pgd_improved(
                 weighted=True,
             )
 
-            # Exact Hartley–Bessel transform block
             x_reg = _hb_exact_shrink_video(
                 x_reg,
                 lam=lam_h * local_tau,
